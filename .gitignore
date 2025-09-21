@@ -1,15 +1,11 @@
-﻿# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
+﻿__pycache__/
+*.pyc
 .venv/
-.env/
-# VS Code
-.vscode/
-# OS
-.DS_Store
-Thumbs.db
-# Local outputs
+.env
 saved_idqn/
+wandb/
 *.pt
 *.pth
+.DS_Store
+.vscode/
+.idea/

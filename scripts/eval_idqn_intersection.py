@@ -28,7 +28,7 @@ def flatten_obs(x):
     x = np.asarray(x, dtype=np.float32)
     return x.reshape(-1)
 
-def make_env(n_agents=2, render=False, duration=200, vehicles_count=8):
+def make_env(n_agents=4, render=False, duration=10, vehicles_count=8):
     # mirror TRAINING config exactly
     return gym.make(
         "intersection-v1",
@@ -38,15 +38,16 @@ def make_env(n_agents=2, render=False, duration=200, vehicles_count=8):
             "duration": duration,
             "vehicles_count": vehicles_count,
             "spawn_probability": 0.35,
+            "destination": None, #random
             "observation": {
                 "type": "MultiAgentObservation",
                 "observation_config": {
                     "type": "Kinematics",
                     "vehicles_count": 15,  # <-- important: 15 * 7 = 105 obs dim
-                    "features": ["presence","x","y","vx","vy","cos_h","sin_h"],
+                    "features": ["presence","x","y","vx","vy","cos_h","sin_h", "cos_d","sin_d"],
                     "absolute": True,
                     "flatten": False,
-                    "observe_intentions": False
+                    "observe_intentions": True,  # <-- important: adds cos_d,sin_d
                 },
             },
             "action": {
@@ -95,9 +96,9 @@ def greedy_action(net, obs, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", type=str, default="saved_idqn")
-    parser.add_argument("--n-agents", type=int, default=2)
-    parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--duration", type=int, default=200)
+    parser.add_argument("--n-agents", type=int, default=4)
+    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--duration", type=int, default=20)
     parser.add_argument("--vehicles", type=int, default=8)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=0)

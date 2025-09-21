@@ -13,6 +13,8 @@ import gymnasium as gym
 import highway_env
 from tqdm import trange
 
+from scripts.reward_multiagent import MultiAgentShapingWrapper  # reward script to assist w training
+
 # ----------------------- utils -----------------------
 def flatten_obs(x):
     x = np.asarray(x, dtype=np.float32)
@@ -66,7 +68,6 @@ class DQNAgent:
         self.steps_done = 0
 
     def epsilon(self):
-        # exponential decay
         frac = min(1.0, self.steps_done / self.eps_decay)
         return self.eps_end + (self.eps_start - self.eps_end) * math.exp(-3.0 * frac)
 
@@ -86,7 +87,6 @@ class DQNAgent:
     def update(self):
         if len(self.buffer) < self.batch_size:
             return 0.0
-
         batch = self.buffer.sample(self.batch_size)
         state  = torch.as_tensor(np.stack(batch.state), dtype=torch.float32, device=self.device)
         action = torch.as_tensor(batch.action, dtype=torch.long, device=self.device).unsqueeze(-1)
@@ -94,7 +94,7 @@ class DQNAgent:
         next_s = torch.as_tensor(np.stack(batch.next_state), dtype=torch.float32, device=self.device)
         done   = torch.as_tensor(batch.done, dtype=torch.float32, device=self.device).unsqueeze(-1)
 
-        q = self.policy(state).gather(1, action)  # Q(s,a)
+        q = self.policy(state).gather(1, action)
         with torch.no_grad():
             next_q = self.target(next_s).max(dim=1, keepdim=True)[0]
             target = reward + (1.0 - done) * self.gamma * next_q
@@ -123,17 +123,19 @@ def make_env(n_agents=2, render=False, duration=300, vehicles_count=6):
             "controlled_vehicles": n_agents,
             "duration": duration,
             "vehicles_count": vehicles_count,
-            "spawn_probability": 0.35,  # gentler traffic for learnability
+            "spawn_probability": 0.35,
+            "destination": None, #random
             # --- observations/actions (multi-agent) ---
             "observation": {
                 "type": "MultiAgentObservation",
                 "observation_config": {
                     "type": "Kinematics",
                     "vehicles_count": 15,
-                    "features": ["presence","x","y","vx","vy","cos_h","sin_h"],
+                    # add intention direction so we can reward progress v·d_hat
+                    "features": ["presence","x","y","vx","vy","cos_h","sin_h","cos_d","sin_d"],
                     "absolute": True,
                     "flatten": False,
-                    "observe_intentions": False
+                    "observe_intentions": True
                 },
             },
             "action": {
@@ -145,18 +147,17 @@ def make_env(n_agents=2, render=False, duration=300, vehicles_count=6):
                     "target_speeds": [0, 4.5, 9.0],
                 },
             },
-            # --- reward shaping knobs ---
-            "collision_reward": -10.0,   # harsher penalty
-            "high_speed_reward": 0.4,    # gentle dense reward for moving
-            "arrived_reward": 5.0,       # strong sparse success
-            "reward_speed_range": [4.0, 9.5],  # reward "reasonable fast", not reckless
-            "normalize_reward": True,     # scales to [0,1] using [collision, arrived]
+            # --- base reward knobs (env-level) ---
+            "collision_reward": -12.0,
+            "high_speed_reward": 0.4,
+            "arrived_reward": 8.0,
+            "reward_speed_range": [4.0, 9.5],
+            "normalize_reward": True,
             "offroad_terminal": False,
         },
     )
 
 def per_agent_action_space(env):
-    # env.action_space is Tuple(Discrete, Discrete, ...)
     assert isinstance(env.action_space, spaces.Tuple)
     return [sp.n for sp in env.action_space.spaces]
 
@@ -165,7 +166,20 @@ def train(seed=0, n_agents=2, episodes=1000, render=False, save_dir="saved_idqn"
     os.makedirs(save_dir, exist_ok=True)
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
-    env = make_env(n_agents=n_agents, render=render, duration=200, vehicles_count=8)
+    # base env → wrap with shaping
+    base_env = make_env(n_agents=n_agents, render=render, duration=200, vehicles_count=8)
+    env = MultiAgentShapingWrapper(
+        base_env,
+        progress_alpha=0.02,   # scale for progress reward
+        step_beta=0.005,       # time penalty per step
+        block_gamma=0.02,      # penalty for idling in center box
+        block_speed_thresh=0.5,
+        box_xy=12.0,
+        coop_bonus=0.2,        # small bonus to others when one arrives
+        arrival_threshold=4.0, # detect arrival spike from base reward
+        reduce_to_scalar="mean"
+    )
+
     obs, info = env.reset(seed=seed)
 
     # per-agent dims
@@ -196,7 +210,7 @@ def train(seed=0, n_agents=2, episodes=1000, render=False, save_dir="saved_idqn"
             # take a step
             obs2, reward, terminated, truncated, info = env.step(tuple(actions))
 
-            # >>> per-agent reward handling <<<
+            # per-agent rewards (wrapper always fills info['agents_rewards'])
             if isinstance(info, dict) and "agents_rewards" in info:
                 rew_vec = [float(r) for r in info["agents_rewards"]]
             elif isinstance(reward, (list, tuple, np.ndarray)):
@@ -241,5 +255,5 @@ def train(seed=0, n_agents=2, episodes=1000, render=False, save_dir="saved_idqn"
     print("Training finished. Best return:", best_return)
 
 if __name__ == "__main__":
-    # set render=True if you want to see it while training (slower)
-    train(seed=0, n_agents=2, episodes=10000, render=False)
+    # train with any N; keep eval config identical
+    train(seed=0, n_agents=4, episodes=10000, render=False)
