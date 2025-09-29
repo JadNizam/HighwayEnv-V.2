@@ -250,20 +250,26 @@ class IntersectionEnv(AbstractEnv):
 
     def _make_vehicles(self, n_vehicles: int = 10) -> None:
         """
-        Populate a road with several vehicles on the highway and on the merging lane
-
-        :return: the ego-vehicle
+        Populate the road with background traffic + 8 controlled vehicles
+        (2 per approach: N, S, E, W). Keeps the original style:
+        - background vehicles first and spread via a few sim steps
+        - a "challenger" vehicle
+        - then controlled vehicles
         """
-        # Configure vehicles
+
+        # ---- Configure background vehicles (same as original) ----
         vehicle_type = utils.class_from_path(self.config["other_vehicles_type"])
-        vehicle_type.DISTANCE_WANTED = 7  # Low jam distance
+        vehicle_type.DISTANCE_WANTED = 7
         vehicle_type.COMFORT_ACC_MAX = 6
         vehicle_type.COMFORT_ACC_MIN = -3
 
-        # Random vehicles
+        # Background vehicles: use initial_vehicle_count, leave room for 8 controlled
+        # The original code used (n_vehicles - 1) here; we keep "initial_vehicle_count"
+        # but you can also pass n_vehicles if you prefer external control.
+        bg_total = int(self.config.get("initial_vehicle_count", 10))
         simulation_steps = 3
-        for t in range(n_vehicles - 1):
-            self._spawn_vehicle(np.linspace(0, 80, n_vehicles)[t])
+        for t in range(max(0, bg_total - 1)):
+            self._spawn_vehicle(np.linspace(0, 80, max(1, bg_total))[t])
         for _ in range(simulation_steps):
             [
                 (
@@ -273,7 +279,7 @@ class IntersectionEnv(AbstractEnv):
                 for _ in range(self.config["simulation_frequency"])
             ]
 
-        # Challenger vehicle
+        # ---- Challenger vehicle (same as original) ----
         self._spawn_vehicle(
             60,
             spawn_probability=1.0,
@@ -282,40 +288,79 @@ class IntersectionEnv(AbstractEnv):
             speed_deviation=0.0,
         )
 
-        # Controlled vehicles
+        # ---- Controlled vehicles: 2 per approach (total 8) ----
+        # Approaches keyed like in _make_road(): corners 0..3
+        # Incoming lane for approach k: ("o{k}", "ir{k}", 0)
+        # We'll place two controlled vehicles per incoming lane, staggered in s.
         self.controlled_vehicles = []
-        for ego_id in range(0, self.config["controlled_vehicles"]):
-            ego_lane = self.road.network.get_lane(
-                (f"o{ego_id % 4}", f"ir{ego_id % 4}", 0)
-            )
-            destination = self.config["destination"] or "o" + str(
-                self.np_random.integers(1, 4)
-            )
-            ego_vehicle = self.action_type.vehicle_class(
-                self.road,
-                ego_lane.position(60.0 + 5.0 * self.np_random.normal(1.0), 0.0),
-                speed=ego_lane.speed_limit,
-                heading=ego_lane.heading_at(60.0),
-            )
-            try:
-                ego_vehicle.plan_route_to(destination)
-                ego_vehicle.speed_index = ego_vehicle.speed_to_index(
-                    ego_lane.speed_limit
-                )
-                ego_vehicle.target_speed = ego_vehicle.index_to_speed(
-                    ego_vehicle.speed_index
-                )
-            except AttributeError:
-                pass
+        desired_ctrl = int(self.config.get("controlled_vehicles", 8))
+        offsets = [60.0, 35.0]  # meters from the network outer end toward the stop line
 
-            self.road.vehicles.append(ego_vehicle)
-            self.controlled_vehicles.append(ego_vehicle)
-            for v in self.road.vehicles:  # Prevent early collisions
-                if (
-                    v is not ego_vehicle
-                    and np.linalg.norm(v.position - ego_vehicle.position) < 20
-                ):
-                    self.road.vehicles.remove(v)
+        # If caller asked for fewer/more than 8, honor it by filling per approach round-robin
+        approaches = [0, 1, 2, 3]
+        placed = 0
+        for k in approaches:
+            if placed >= desired_ctrl:
+                break
+            ego_lane: AbstractLane = self.road.network.get_lane((f"o{k}", f"ir{k}", 0))
+            lane_len = getattr(ego_lane, "length", 120.0)
+
+            for d in offsets:
+                if placed >= desired_ctrl:
+                    break
+                # Place along the incoming lane at distance s0 from its start toward the center.
+                s0 = np.clip(d, 0.0, lane_len - 1.0)
+                x, y = ego_lane.position(s0, 0.0)
+                heading = ego_lane.heading_at(s0)
+
+                # Create controlled vehicle with the class associated to the ActionType
+                ego_vehicle = self.action_type.vehicle_class(
+                    self.road,
+                    ego_lane.position(s0, 0.0),
+                    speed=ego_lane.speed_limit,
+                    heading=heading,
+                )
+
+                # Route to a destination:
+                # - If config["destination"] is set, use it (original behavior)
+                # - Else, random exit ("o1".."o3" excluding the same side)
+                try:
+                    if self.config["destination"]:
+                        dest = self.config["destination"]
+                    else:
+                        # random exit different from entry side
+                        candidates = [f"o{i}" for i in range(4) if i != k]
+                        dest = self.np_random.choice(candidates)
+                    ego_vehicle.plan_route_to(dest)
+
+                    # Match original speed-indexing behavior if the vehicle supports it
+                    ego_vehicle.speed_index = getattr(
+                        ego_vehicle, "speed_to_index", lambda v: 0
+                    )(ego_lane.speed_limit)
+                    ego_vehicle.target_speed = getattr(
+                        ego_vehicle, "index_to_speed", lambda i: ego_lane.speed_limit
+                    )(getattr(ego_vehicle, "speed_index", 0))
+                except AttributeError:
+                    # Some vehicle classes may not expose plan/index helpers; ignore.
+                    pass
+
+                # Register controlled vehicle
+                self.road.vehicles.append(ego_vehicle)
+                self.controlled_vehicles.append(ego_vehicle)
+                placed += 1
+
+                # Prevent early collisions near spawn: remove non-controlled vehicles too close
+                to_remove = []
+                for v in self.road.vehicles:
+                    if v is ego_vehicle:
+                        continue
+                    if v in self.controlled_vehicles:
+                        continue
+                    if np.linalg.norm(v.position - ego_vehicle.position) < 20:
+                        to_remove.append(v)
+                for v in to_remove:
+                    if v in self.road.vehicles:
+                        self.road.vehicles.remove(v)
 
     def _spawn_vehicle(
         self,

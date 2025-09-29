@@ -11,7 +11,7 @@ class MultiAgentShapingWrapper(gym.Wrapper):
         • Near-headway penalty (front & close)
         • Closing-speed penalty (front & closing)
         • Time-to-collision penalty (min TTC)
-        • Team penalty when a collision spike is detected
+        • Team penalty when a collision is detected (robust to reward normalization)
 
       Progress & flow (existing):
         • progress reward: +alpha * max(0, v · d_hat)
@@ -38,8 +38,8 @@ class MultiAgentShapingWrapper(gym.Wrapper):
                  close_k: float = 0.02,            # weight for closing-speed penalty
                  ttc_thresh: float = 3.0,          # seconds; penalize TTC below this
                  ttc_k: float = 0.08,              # weight for TTC penalty
-                 team_collision_penalty: float = 0.4,  # applied to all agents if collision spike
-                 collision_threshold: float = -6.0,    # base reward ≤ this ⇒ treat as crash
+                 team_collision_penalty: float = 0.4,  # applied to all agents if collision
+                 collision_threshold: float = -6.0,    # fallback: base reward ≤ this ⇒ crash
                  reduce_to_scalar: str = "mean"):
         super().__init__(env)
         assert isinstance(env.action_space, spaces.Tuple), "Expect Tuple action space."
@@ -163,8 +163,15 @@ class MultiAgentShapingWrapper(gym.Wrapper):
                 if j != winner:
                     shaped[j] += self.coop_bonus
 
-        # -------- team penalty on detected collision spike in base reward
-        if float(np.min(base)) <= self.collision_threshold:
+        # -------- team penalty on collision (robust)
+        crash_flag = False
+        if isinstance(info, dict) and "agents_terminated" in info:
+            crash_flag = any(bool(t) for t in info["agents_terminated"])
+        else:
+            # fallback to reward-based detection (requires normalize_reward=False to be reliable)
+            crash_flag = float(np.min(base)) <= self.collision_threshold
+
+        if crash_flag:
             shaped -= self.team_collision_penalty
 
         # expose vector and return scalar for Gym API
