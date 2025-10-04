@@ -21,6 +21,18 @@ def flatten_obs(x):
     x = np.asarray(x, dtype=np.float32)
     return x.reshape(-1)  # 1D vector
 
+def moving_average(arr, w=100):
+    """Return NaN-aligned moving average of width w (front-padded so len matches)."""
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) == 0 or w <= 1:
+        return arr.astype(float)
+    if len(arr) < w:
+        # not enough points yet -> all NaNs except the simple mean at the end would be misleading
+        return np.concatenate([np.full(len(arr), np.nan)])
+    kernel = np.ones(w, dtype=float) / w
+    ma_valid = np.convolve(arr, kernel, mode="valid")
+    return np.concatenate([np.full(w - 1, np.nan), ma_valid])
+
 Transition = namedtuple("Transition", "state action reward next_state done")
 
 class ReplayBuffer:
@@ -131,7 +143,7 @@ def make_env(n_agents=8, render=False, duration=100, vehicles_count=8):
                 "type": "MultiAgentObservation",
                 "observation_config": {
                     "type": "Kinematics",
-                    "vehicles_count": 10,  # was 10 (kept smaller than 15 to speed up & simplify)
+                    "vehicles_count": 10,  # kept smaller than 15 to speed up & simplify
                     "features": ["presence","x","y","vx","vy","cos_h","sin_h","cos_d","sin_d"],
                     "absolute": True,
                     "flatten": False,
@@ -265,27 +277,30 @@ def train(seed=0, n_agents=8, episodes=20000, render=False, save_dir="saved_idqn
                 ag.save(os.path.join(save_dir, f"agent_{i}_ep{ep}.pt"))
 
         episode_returns.append(ep_return)
-        print(f"Episode {ep} | steps {steps} | return {ep_return:.2f} | loss {ep_loss:.3f}")
+        ma100_tail = np.mean(episode_returns[-100:]) if len(episode_returns) >= 100 else np.nan
+        print(f"Episode {ep} | steps {steps} | return {ep_return:.2f} | MA100 {ma100_tail:.2f} | loss {ep_loss:.3f}")
 
     # -------- save reward curve (CSV + PNG) --------
     rewards = np.asarray(episode_returns, dtype=float)
+    ma100 = moving_average(rewards, w=100)
+
     csv_path = os.path.join(save_dir, "episode_rewards.csv")
-    np.savetxt(csv_path, rewards, delimiter=",", header="episode_reward", comments="")
-    print(f"Saved episode rewards to {csv_path}")
+    # Save two columns: reward, ma100
+    np.savetxt(
+        csv_path,
+        np.column_stack([rewards, ma100]),
+        delimiter=",",
+        header="episode_reward,ma100",
+        comments="",
+    )
+    print(f"Saved episode rewards (with MA100) to {csv_path}")
 
     try:
         import matplotlib.pyplot as plt  # optional
-        window = max(1, len(rewards) // 20)  # ~5% moving average
-        if window > 1:
-            cumsum = np.cumsum(np.insert(rewards, 0, 0.0))
-            ma = (cumsum[window:] - cumsum[:-window]) / float(window)
-            ma_aligned = np.concatenate([np.full(window - 1, np.nan), ma])
-        else:
-            ma_aligned = rewards
 
         plt.figure()
         plt.plot(rewards, label="Episode reward")
-        plt.plot(ma_aligned, label=f"Moving avg ({window})")
+        plt.plot(ma100, label="Moving avg (100)")
         plt.xlabel("Episode")
         plt.ylabel("Reward")
         plt.title("Reward vs Episode")

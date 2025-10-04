@@ -41,19 +41,32 @@ class IntersectionEnv(AbstractEnv):
                 },
                 "duration": 13,  # [s]
                 "destination": "o1",
-                "controlled_vehicles": 1,
+                "controlled_vehicles": 1,        # ← set this to any N (dynamic agents)
                 "initial_vehicle_count": 10,
                 "spawn_probability": 0.6,
+
+                # Spawn layout controls for controlled vehicles (optional)
+                "spawn_start_offset": 60.0,      # meters from incoming lane start
+                "spawn_spacing": 22.0,           # meters between controlled vehicles
+
+                # Viewer defaults
                 "screen_width": 600,
                 "screen_height": 600,
                 "centering_position": [0.5, 0.6],
                 "scaling": 5.5 * 1.3,
+
+                # Rewards
                 "collision_reward": -5,
                 "high_speed_reward": 1,
                 "arrived_reward": 1,
                 "reward_speed_range": [7.0, 9.0],
                 "normalize_reward": False,
                 "offroad_terminal": False,
+
+                # ------- Camera control (new) -------
+                "fixed_camera": False,           # when True, lock camera every frame
+                "camera_center": [0.0, 0.0],     # world coords
+                "camera_zoom": None,             # None keeps scaling; else float (e.g., 4.5)
             }
         )
         return config
@@ -131,27 +144,29 @@ class IntersectionEnv(AbstractEnv):
     def _reset(self) -> None:
         self._make_road()
         self._make_vehicles(self.config["initial_vehicle_count"])
+        # Lock camera if enabled
+        self._apply_fixed_camera()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         obs, reward, terminated, truncated, info = super().step(action)
         self._clear_vehicles()
         self._spawn_vehicle(spawn_probability=self.config["spawn_probability"])
+        # Keep camera pinned every step (if enabled)
+        self._apply_fixed_camera()
         return obs, reward, terminated, truncated, info
 
     def _make_road(self) -> None:
         """
-        Make an 4-way intersection.
+        Make a 4-way intersection.
 
-        The horizontal road has the right of way. More precisely, the levels of priority are:
+        The horizontal road has the right of way. Priority levels:
             - 3 for horizontal straight lanes and right-turns
             - 1 for vertical straight lanes and right-turns
             - 2 for horizontal left-turns
             - 0 for vertical left-turns
 
-        The code for nodes in the road network is:
+        Node codes:
         (o:outer | i:inner + [r:right, l:left]) + (0:south | 1:west | 2:north | 3:east)
-
-        :return: the intersection road
         """
         lane_width = AbstractLane.DEFAULT_WIDTH
         right_turn_radius = lane_width + 5  # [m}
@@ -169,16 +184,12 @@ class IntersectionEnv(AbstractEnv):
                 [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
             )
             # Incoming
-            start = rotation @ np.array(
-                [lane_width / 2, access_length + outer_distance]
-            )
+            start = rotation @ np.array([lane_width / 2, access_length + outer_distance])
             end = rotation @ np.array([lane_width / 2, outer_distance])
             net.add_lane(
                 "o" + str(corner),
                 "ir" + str(corner),
-                StraightLane(
-                    start, end, line_types=[s, c], priority=priority, speed_limit=10.0
-                ),
+                StraightLane(start, end, line_types=[s, c], priority=priority, speed_limit=10.0),
             )
             # Right turn
             r_center = rotation @ (np.array([outer_distance, outer_distance]))
@@ -224,21 +235,15 @@ class IntersectionEnv(AbstractEnv):
             net.add_lane(
                 "ir" + str(corner),
                 "il" + str((corner + 2) % 4),
-                StraightLane(
-                    start, end, line_types=[s, n], priority=priority, speed_limit=10.0
-                ),
+                StraightLane(start, end, line_types=[s, n], priority=priority, speed_limit=10.0),
             )
             # Exit
-            start = rotation @ np.flip(
-                [lane_width / 2, access_length + outer_distance], axis=0
-            )
+            start = rotation @ np.flip([lane_width / 2, access_length + outer_distance], axis=0)
             end = rotation @ np.flip([lane_width / 2, outer_distance], axis=0)
             net.add_lane(
                 "il" + str((corner - 1) % 4),
                 "o" + str((corner - 1) % 4),
-                StraightLane(
-                    end, start, line_types=[n, c], priority=priority, speed_limit=10.0
-                ),
+                StraightLane(end, start, line_types=[n, c], priority=priority, speed_limit=10.0),
             )
 
         road = RegulatedRoad(
@@ -248,13 +253,74 @@ class IntersectionEnv(AbstractEnv):
         )
         self.road = road
 
+    # ------- Fixed camera (viewer-only; no vehicle/logic mutation) -------
+    def _apply_fixed_camera(self) -> None:
+        """Lock the viewer camera to a fixed world center (if enabled in config)."""
+        if not self.config.get("fixed_camera", False):
+            return
+        try:
+            v = getattr(self.unwrapped, "viewer", None)
+            if v is None:
+                return
+
+            # disable any auto-follow / dynamic view if present
+            for attr in ("follow_ego", "track_vehicle", "track_agent", "dynamic_display", "auto_zoom"):
+                if hasattr(v, attr):
+                    try:
+                        setattr(v, attr, False)
+                    except Exception:
+                        pass
+
+            # set zoom/scaling if provided
+            zoom = self.config.get("camera_zoom", None)
+            if zoom is not None:
+                for attr in ("scaling", "zoom"):
+                    if hasattr(v, attr):
+                        try:
+                            setattr(v, attr, float(zoom))
+                            break
+                        except Exception:
+                            pass
+
+            # set a fixed center if viewer exposes it
+            center = np.array(self.config.get("camera_center", [0.0, 0.0]), dtype=float)
+            for attr in ("center", "world_center", "camera_center"):
+                if hasattr(v, attr):
+                    try:
+                        setattr(v, attr, center)
+                    except Exception:
+                        pass
+
+            # point any "tracked vehicle" handles to None (stop tracking ego)
+            for method in ("set_agent", "set_tracked_vehicle", "track"):
+                if hasattr(v, method):
+                    try:
+                        getattr(v, method)(None)
+                    except Exception:
+                        pass
+            for attr in ("vehicle_to_track", "ego_vehicle", "vehicle"):
+                if hasattr(v, attr):
+                    try:
+                        setattr(v, attr, None)
+                    except Exception:
+                        pass
+        except Exception:
+            # never fail env logic if viewer hacks misbehave
+            pass
+
+    # ---------------------- DYNAMIC CONTROLLED AGENTS ----------------------
+    def _incoming_lane(self, approach_idx: int) -> AbstractLane:
+        """Helper: incoming lane for approach k: (o{k} -> ir{k}, lane 0)."""
+        return self.road.network.get_lane((f"o{approach_idx}", f"ir{approach_idx}", 0))
+
     def _make_vehicles(self, n_vehicles: int = 10) -> None:
         """
-        Populate the road with background traffic + 8 controlled vehicles
-        (2 per approach: N, S, E, W). Keeps the original style:
-        - background vehicles first and spread via a few sim steps
-        - a "challenger" vehicle
-        - then controlled vehicles
+        Populate the road with background traffic + dynamically many controlled vehicles.
+
+        - Background vehicles are spawned first and rolled a few steps (original style).
+        - A "challenger" vehicle is spawned next (original).
+        - Then we place ANY number of controlled vehicles specified by config["controlled_vehicles"],
+          distributed round-robin across the 4 approaches with safe spacing.
         """
 
         # ---- Configure background vehicles (same as original) ----
@@ -263,9 +329,7 @@ class IntersectionEnv(AbstractEnv):
         vehicle_type.COMFORT_ACC_MAX = 6
         vehicle_type.COMFORT_ACC_MIN = -3
 
-        # Background vehicles: use initial_vehicle_count, leave room for 8 controlled
-        # The original code used (n_vehicles - 1) here; we keep "initial_vehicle_count"
-        # but you can also pass n_vehicles if you prefer external control.
+        # Background vehicles
         bg_total = int(self.config.get("initial_vehicle_count", 10))
         simulation_steps = 3
         for t in range(max(0, bg_total - 1)):
@@ -288,60 +352,60 @@ class IntersectionEnv(AbstractEnv):
             speed_deviation=0.0,
         )
 
-        # ---- Controlled vehicles: 2 per approach (total 8) ----
-        # Approaches keyed like in _make_road(): corners 0..3
-        # Incoming lane for approach k: ("o{k}", "ir{k}", 0)
-        # We'll place two controlled vehicles per incoming lane, staggered in s.
+        # ---- Controlled vehicles: dynamic N across approaches ----
         self.controlled_vehicles = []
-        desired_ctrl = int(self.config.get("controlled_vehicles", 8))
-        offsets = [60.0, 35.0]  # meters from the network outer end toward the stop line
+        desired_ctrl = int(self.config.get("controlled_vehicles", 1))
+        if desired_ctrl <= 0:
+            return
 
-        # If caller asked for fewer/more than 8, honor it by filling per approach round-robin
         approaches = [0, 1, 2, 3]
-        placed = 0
-        for k in approaches:
-            if placed >= desired_ctrl:
-                break
-            ego_lane: AbstractLane = self.road.network.get_lane((f"o{k}", f"ir{k}", 0))
-            lane_len = getattr(ego_lane, "length", 120.0)
+        start_offset = float(self.config.get("spawn_start_offset", 60.0))
+        spacing = float(self.config.get("spawn_spacing", 22.0))
+        margin = 5.0  # leave a small margin from lane end
 
-            for d in offsets:
+        # Round-robin fill across approaches; depth increases every full round
+        placed = 0
+        depth = 0
+        while placed < desired_ctrl:
+            for k in approaches:
                 if placed >= desired_ctrl:
                     break
-                # Place along the incoming lane at distance s0 from its start toward the center.
-                s0 = np.clip(d, 0.0, lane_len - 1.0)
-                x, y = ego_lane.position(s0, 0.0)
-                heading = ego_lane.heading_at(s0)
 
-                # Create controlled vehicle with the class associated to the ActionType
+                lane: AbstractLane = self._incoming_lane(k)
+                lane_len = getattr(lane, "length", 120.0)
+
+                # Distance from lane start toward the center for this "depth" slot
+                s0 = start_offset + depth * spacing
+                # Keep within lane bounds
+                s0 = float(np.clip(s0, 0.0, max(0.0, lane_len - margin)))
+
+                position = lane.position(s0, 0.0)
+                heading = lane.heading_at(s0)
+
                 ego_vehicle = self.action_type.vehicle_class(
                     self.road,
-                    ego_lane.position(s0, 0.0),
-                    speed=ego_lane.speed_limit,
+                    position,
+                    speed=lane.speed_limit,
                     heading=heading,
                 )
 
-                # Route to a destination:
-                # - If config["destination"] is set, use it (original behavior)
-                # - Else, random exit ("o1".."o3" excluding the same side)
+                # Route to destination
                 try:
                     if self.config["destination"]:
                         dest = self.config["destination"]
                     else:
-                        # random exit different from entry side
                         candidates = [f"o{i}" for i in range(4) if i != k]
                         dest = self.np_random.choice(candidates)
                     ego_vehicle.plan_route_to(dest)
 
-                    # Match original speed-indexing behavior if the vehicle supports it
+                    # Match original speed-indexing behavior if available
                     ego_vehicle.speed_index = getattr(
                         ego_vehicle, "speed_to_index", lambda v: 0
-                    )(ego_lane.speed_limit)
+                    )(lane.speed_limit)
                     ego_vehicle.target_speed = getattr(
-                        ego_vehicle, "index_to_speed", lambda i: ego_lane.speed_limit
+                        ego_vehicle, "index_to_speed", lambda i: lane.speed_limit
                     )(getattr(ego_vehicle, "speed_index", 0))
                 except AttributeError:
-                    # Some vehicle classes may not expose plan/index helpers; ignore.
                     pass
 
                 # Register controlled vehicle
@@ -349,18 +413,20 @@ class IntersectionEnv(AbstractEnv):
                 self.controlled_vehicles.append(ego_vehicle)
                 placed += 1
 
-                # Prevent early collisions near spawn: remove non-controlled vehicles too close
+                # Clear nearby background cars to avoid immediate collisions at spawn
                 to_remove = []
                 for v in self.road.vehicles:
-                    if v is ego_vehicle:
+                    if v is ego_vehicle or v in self.controlled_vehicles:
                         continue
-                    if v in self.controlled_vehicles:
-                        continue
-                    if np.linalg.norm(v.position - ego_vehicle.position) < 20:
+                    if np.linalg.norm(v.position - ego_vehicle.position) < 20.0:
                         to_remove.append(v)
                 for v in to_remove:
                     if v in self.road.vehicles:
                         self.road.vehicles.remove(v)
+
+            depth += 1  # next “ring” deeper along each incoming lane
+
+    # ---------------------------------------------------------------------
 
     def _spawn_vehicle(
         self,
@@ -379,9 +445,7 @@ class IntersectionEnv(AbstractEnv):
         vehicle = vehicle_type.make_on_lane(
             self.road,
             ("o" + str(route[0]), "ir" + str(route[0]), 0),
-            longitudinal=(
-                longitudinal + 5.0 + self.np_random.normal() * position_deviation
-            ),
+            longitudinal=(longitudinal + 5.0 + self.np_random.normal() * position_deviation),
             speed=8.0 + self.np_random.normal() * speed_deviation,
         )
         for v in self.road.vehicles:
@@ -432,7 +496,7 @@ class MultiAgentIntersectionEnv(IntersectionEnv):
                     "type": "MultiAgentObservation",
                     "observation_config": {"type": "Kinematics"},
                 },
-                "controlled_vehicles": 2,
+                "controlled_vehicles": 2,  # default small; pass any N via config
             }
         )
         return config

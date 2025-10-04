@@ -98,7 +98,8 @@ class EnvViewer:
             actions = [self.env.action_type.actions[a] for a in actions]
         elif isinstance(self.env.action_type, ContinuousAction):
             actions = [self.env.action_type.get_action(a) for a in actions]
-        if len(actions) > 1:
+        if len(actions) > 1 and self.env.vehicle is not None:
+            # Predict from the env's "vehicle" if available
             self.vehicle_trajectory = self.env.vehicle.predict_trajectory(
                 actions,
                 1 / self.env.config["policy_frequency"],
@@ -120,7 +121,21 @@ class EnvViewer:
         if not self.enabled:
             return
 
+        # --- Fixed-camera support: apply zoom and disable observer following ---
+        if self.config.get("fixed_camera", False):
+            # If a fixed zoom is provided, enforce it every frame so user changes stick
+            cam_zoom = self.config.get("camera_zoom", None)
+            if cam_zoom is not None:
+                try:
+                    self.sim_surface.scaling = float(cam_zoom)
+                except Exception:
+                    pass
+            # Make sure we don't follow any vehicle when fixed camera is on
+            self.observer_vehicle = None
+
+        # Center the window: either fixed center or ego/observer position
         self.sim_surface.move_display_window_to(self.window_position())
+
         RoadGraphics.display(self.env.road, self.sim_surface)
 
         if self.vehicle_trajectory:
@@ -182,12 +197,17 @@ class EnvViewer:
 
     def window_position(self) -> np.ndarray:
         """the world position of the center of the displayed window."""
-        if self.observer_vehicle:
+        # New: fixed camera center takes precedence
+        if self.config.get("fixed_camera", False):
+            center = self.config.get("camera_center", [0.0, 0.0])
+            return np.array(center, dtype=float)
+
+        if self.observer_vehicle is not None:
             return self.observer_vehicle.position
-        elif self.env.vehicle:
+        elif getattr(self.env, "vehicle", None) is not None:
             return self.env.vehicle.position
         else:
-            return np.array([0, 0])
+            return np.array([0.0, 0.0], dtype=float)
 
     def close(self) -> None:
         """Close the pygame window."""
